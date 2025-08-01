@@ -1,4 +1,5 @@
 import torch
+from itertools import chain
 import torch.nn.functional as F
 import torch.nn as nn
 from torch.nn import Conv1d, ConvTranspose1d, AvgPool1d, Conv2d
@@ -13,6 +14,7 @@ from norm2d import NormConv2d
 from utils import get_padding
 from munch import Munch
 from conformer import Conformer
+from snake_fused_triton import Snake
 
 LRELU_SLOPE = 0.1
 
@@ -23,11 +25,51 @@ def get_2d_padding(kernel_size, dilation=(1, 1)):
         ((kernel_size[1] - 1) * dilation[1]) // 2,
     )
 
-
-
-class ResBlock1(torch.nn.Module):
+class ResBlock1_Snake_Fused(torch.nn.Module):
     def __init__(self, h, channels, kernel_size=3, dilation=(1, 3, 5)):
-        super(ResBlock1, self).__init__()
+        super(ResBlock1_Snake_Fused, self).__init__()
+        self.h = h
+        self.convs1 = nn.ModuleList([
+            weight_norm(Conv1d(channels, channels, kernel_size, 1, dilation=dilation[0],
+                               padding=get_padding(kernel_size, dilation[0]))),
+            weight_norm(Conv1d(channels, channels, kernel_size, 1, dilation=dilation[1],
+                               padding=get_padding(kernel_size, dilation[1]))),
+            weight_norm(Conv1d(channels, channels, kernel_size, 1, dilation=dilation[2],
+                               padding=get_padding(kernel_size, dilation[2])))
+        ])
+        self.convs1.apply(init_weights)
+
+        self.convs2 = nn.ModuleList([
+            weight_norm(Conv1d(channels, channels, kernel_size, 1, dilation=1,
+                               padding=get_padding(kernel_size, 1))),
+            weight_norm(Conv1d(channels, channels, kernel_size, 1, dilation=1,
+                               padding=get_padding(kernel_size, 1))),
+            weight_norm(Conv1d(channels, channels, kernel_size, 1, dilation=1,
+                               padding=get_padding(kernel_size, 1)))
+        ])
+        self.convs2.apply(init_weights)
+        
+        self.snake1 = Snake(channels, init='periodic', correction='std')
+        self.snake2 = Snake(channels, init='periodic', correction='std')
+
+
+    def forward(self, x):
+        for c1, c2 in zip(self.convs1, self.convs2):
+            x_residual = x # Residual store
+            xt = self.snake1(x) # Snake activation 1
+            xt = c1(xt) # Conv 1
+            xt = self.snake2(xt) # Snake activation 2
+            xt = c2(xt) # Conv 2
+            x = xt + x_residual # Residual connection
+        return x
+
+    def remove_weight_norm(self):
+        for conv in chain(self.convs1, self.convs2):
+            remove_weight_norm(conv)
+
+class ResBlock1_Snake(torch.nn.Module):
+    def __init__(self, h, channels, kernel_size=3, dilation=(1, 3, 5)):
+        super(ResBlock1_Snake, self).__init__()
         self.h = h
         self.convs1 = nn.ModuleList([
             weight_norm(Conv1d(channels, channels, kernel_size, 1, dilation=dilation[0],
@@ -55,20 +97,19 @@ class ResBlock1(torch.nn.Module):
 
     def forward(self, x):
         for c1, c2, a1, a2 in zip(self.convs1, self.convs2, self.alpha1, self.alpha2):
-            xt = x + (1 / a1) * (torch.sin(a1 * x) ** 2)  # Snake1D
-            xt = c1(xt)
-            xt = xt + (1 / a2) * (torch.sin(a2 * xt) ** 2)  # Snake1D
-            xt = c2(xt)
-            x = xt + x
+            x_residual = x # Residual store
+            xt = x + (1 / a1) * (torch.sin(a1 * x) ** 2)  # Snake1D act
+            xt = c1(xt) # Conv 1
+            xt = xt + (1 / a2) * (torch.sin(a2 * xt) ** 2)  # Snake1D act
+            xt = c2(xt) # Conv 2
+            x = xt + x_residual # Residual connection
         return x
 
     def remove_weight_norm(self):
-        for l in self.convs1:
-            remove_weight_norm(l)
-        for l in self.convs2:
-            remove_weight_norm(l)
+        for conv in chain(self.convs1, self.convs2):
+            remove_weight_norm(conv)
 
-class ResBlock1_old(torch.nn.Module):
+class ResBlock1(torch.nn.Module):
     def __init__(self, h, channels, kernel_size=3, dilation=(1, 3, 5)):
         super(ResBlock1, self).__init__()
         self.h = h
@@ -102,10 +143,8 @@ class ResBlock1_old(torch.nn.Module):
         return x
 
     def remove_weight_norm(self):
-        for l in self.convs1:
-            remove_weight_norm(l)
-        for l in self.convs2:
-            remove_weight_norm(l)
+        for conv in chain(self.convs1, self.convs2):
+            remove_weight_norm(conv)
 
 
 class ResBlock2(torch.nn.Module):
@@ -325,16 +364,25 @@ def padDiff(x):
             
 
 class Generator(torch.nn.Module):
-    def __init__(self, h, F0_model):
+    def __init__(
+        self,
+        h,
+        F0_model,
+    ):
         super(Generator, self).__init__()
         self.h = h
         self.num_kernels = len(h.resblock_kernel_sizes)
         self.num_upsamples = len(h.upsample_rates)
         self.conv_pre = weight_norm(Conv1d(128, h.upsample_initial_channel, 7, 1, padding=3))
-        
-        
 
-        resblock = ResBlock1 if h.resblock == '1' else ResBlock2
+        resblock_mapping = {
+            'ResBlock1': ResBlock1,
+            'ResBlock2': ResBlock2,
+            'ResBlock1_Snake': ResBlock1_Snake,
+            'ResBlock1_Snake_Fused': ResBlock1_Snake_Fused
+        }
+        resblock = resblock_mapping.get(h.resblock)
+
 
         self.m_source = SourceModuleHnNSF(
                     sampling_rate=h.sampling_rate,

@@ -1,7 +1,7 @@
 {
     "F0_path": "/home/ubuntu/Darya_Speech/Utils/JDC/epoch_00079.pth",
     
-    "resblock": "1",
+    "resblock": "ResBlock1_Snake_Fused",
     "num_gpus": 1,
     "batch_size": 18,
     "learning_rate": 0.0002,
